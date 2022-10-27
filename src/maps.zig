@@ -10,6 +10,8 @@
 
 const std = @import("std");
 
+pub const sample_frequency = 44_100;
+
 pub const Sample = f32;
 
 pub const Channel = enum {
@@ -85,16 +87,20 @@ pub const Mixer = struct {
         std.mem.set(Sample, left_buffer, 0.0);
         std.mem.set(Sample, right_buffer, 0.0);
 
+        std.debug.print("mix {} samples, {} streams\n", .{ left_buffer.len, mixer.streams.len });
+
         var left_scratch_buffer: [256]Sample = undefined;
         var right_scratch_buffer: [256]Sample = undefined;
 
         var stream_index: usize = 0;
-        while (stream_index < mixer.streams.len) {
+        next_stream: while (stream_index < mixer.streams.len) {
             const stream = &mixer.streams.buffer[stream_index];
             if (stream.paused) {
+                std.debug.print("render stream {} ({})\n", .{ stream_index, stream.handle });
                 stream_index += 1;
                 continue;
             }
+            std.debug.print("render stream {} ({})\n", .{ stream_index, stream.handle });
 
             // TODO: Implement stream.pitch handling
 
@@ -105,6 +111,7 @@ pub const Mixer = struct {
             var sample_offset: usize = 0;
             while (sample_offset < left_buffer.len) {
                 const increment = std.math.min(left_buffer.len - sample_offset, left_scratch_buffer.len);
+                defer sample_offset += increment;
 
                 const left_scratch = left_scratch_buffer[0..increment];
                 const right_scratch = right_scratch_buffer[0..increment];
@@ -112,25 +119,31 @@ pub const Mixer = struct {
                 const count = stream.source.fetch(stream.offset, left_scratch, right_scratch);
                 if (count == 0) {
                     // quick opt-out prevents us from mixing silent data
-                    mixer.streams.swapRemove(stream_index);
-                    continue;
+                    std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
+                    _ = mixer.streams.swapRemove(stream_index);
+                    continue :next_stream;
                 }
 
                 for (left_scratch[0..count]) |sample, i| {
-                    left_buffer[i] += sample * left_vol;
+                    left_buffer[sample_offset + i] += sample * left_vol;
                 }
                 for (right_scratch[0..count]) |sample, i| {
-                    right_buffer[i] += sample * right_vol;
+                    right_buffer[sample_offset + i] += sample * right_vol;
                 }
 
                 if (count < left_scratch.len) {
-                    mixer.streams.swapRemove(stream_index);
-                } else {
-                    // we still have samples left
-                    stream_index += 1;
+                    std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
+                    _ = mixer.streams.swapRemove(stream_index);
+                    continue :next_stream;
                 }
+
+                stream.offset += count;
             }
+
+            // we still had samples left
+            stream_index += 1;
         }
+        std.debug.print("done mixing {} streams\n", .{stream_index});
     }
 };
 
@@ -167,12 +180,43 @@ pub const AudioSource = struct {
     }
 
     pub fn cast(source: AudioSource, comptime T: type) *T {
-        return @ptrCast(*SoundFile, @alignCast(@alignOf(SoundFile), source.erased));
+        return @ptrCast(*T, @alignCast(@alignOf(T), source.erased));
     }
 
     pub fn fetch(source: AudioSource, offset_hint: usize, left_samples: []Sample, right_samples: []Sample) usize {
         std.debug.assert(left_samples.len == right_samples.len);
-        return source.vtable.fetchPtr(source.erased, offset_hint, left_samples, right_samples);
+        return source.vtable.fetchPtr(source, offset_hint, left_samples, right_samples);
+    }
+};
+
+pub const SineSource = struct {
+    const vtable = AudioSource.VTable{
+        .fetchPtr = fetchSamples,
+    };
+
+    frequency: f32 = 440,
+    pub fn source(file: *SineSource) AudioSource {
+        return AudioSource.init(file, &vtable);
+    }
+
+    fn fetchSamples(src: AudioSource, offset_hint: usize, left_samples: []Sample, right_samples: []Sample) usize {
+        const sine = src.cast(SineSource);
+
+        const waves_per_sample = 2.0 * std.math.tau * sine.frequency / sample_frequency;
+
+        var time = waves_per_sample * @intToFloat(f32, offset_hint);
+
+        for (left_samples[0..]) |*left, i| {
+            const right = &right_samples[i];
+
+            const sample = @sin(time);
+            left.* = sample;
+            right.* = sample;
+
+            time += waves_per_sample;
+        }
+
+        return left_samples.len;
     }
 };
 
@@ -305,3 +349,66 @@ test "mixer basic stream setup" {
     try std.testing.expectError(error.NotFound, mixer.stop(handle));
     try std.testing.expectError(error.NotFound, mixer.isPaused(handle));
 }
+
+test "mixer basic mix" {
+    var sine_440 = SineSource{ .frequency = 440 };
+    var sine_1000 = SineSource{ .frequency = 1000 };
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sine_440.source());
+    _ = try mixer.play(sine_1000.source());
+
+    var left: [4096]f32 = undefined;
+    var right: [4096]f32 = undefined;
+
+    const cwd = std.fs.cwd();
+    var file = try cwd.createFile("sine.wav", .{});
+    defer file.close();
+
+    const num_chunks: usize = 32;
+    try WaveFileWriter.writeHeaders(file.writer(), num_chunks * left.len);
+
+    var i: usize = 0;
+    while (i < num_chunks) : (i += 1) {
+        mixer.mix(&left, &right);
+
+        try WaveFileWriter.writeAudio(file.writer(), &left, &right);
+    }
+}
+
+const WaveFileWriter = struct {
+    const File = std.fs.File;
+
+    const channels = 1;
+    const HEADER_SIZE = 36;
+    const SUBCHUNK1_SIZE = 16;
+    const AUDIO_FORMAT = 3; // f32
+    const BIT_DEPTH = 32; // bit
+    const BYTE_SIZE = 8;
+    const PI = 3.14159265358979323846264338327950288;
+
+    fn writeHeaders(file: File.Writer, num_samples: u32) !void {
+        try file.writeAll("RIFF");
+        try file.writeIntLittle(u32, HEADER_SIZE + num_samples);
+        try file.writeAll("WAVEfmt ");
+        try file.writeIntLittle(u32, SUBCHUNK1_SIZE);
+        try file.writeIntLittle(u16, AUDIO_FORMAT);
+        try file.writeIntLittle(u16, channels);
+        try file.writeIntLittle(u32, sample_frequency);
+        try file.writeIntLittle(u32, sample_frequency * channels * (BIT_DEPTH / BYTE_SIZE));
+        try file.writeIntLittle(u16, (channels * (BIT_DEPTH / BYTE_SIZE)));
+        try file.writeIntLittle(u16, BIT_DEPTH);
+        try file.writeAll("data");
+        try file.writeIntLittle(u32, num_samples * channels * (BIT_DEPTH / BYTE_SIZE));
+    }
+
+    fn writeAudio(file: File.Writer, left: []const Sample, right: []const Sample) !void {
+        std.debug.assert(left.len == right.len);
+        for (left) |l, i| {
+            const r = right[i];
+            try file.writeIntLittle(u32, @bitCast(u32, l));
+            try file.writeIntLittle(u32, @bitCast(u32, r));
+        }
+    }
+};
