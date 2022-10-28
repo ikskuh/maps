@@ -130,39 +130,71 @@ pub const Mixer = struct {
             }, stream.pan);
 
             var sample_offset: usize = 0;
-            while (sample_offset < left_buffer.len) {
-                const increment = std.math.min(left_buffer.len - sample_offset, left_scratch_buffer.len);
-                defer sample_offset += increment;
 
-                const left_scratch = left_scratch_buffer[0..increment];
-                const right_scratch = right_scratch_buffer[0..increment];
+            var repeated = false;
+            stream_repeater: while (true) {
+                std.debug.print("begin mix {} @ {}\n", .{ stream_index, sample_offset });
 
-                const count = stream.source.fetch(stream.offset, left_scratch, right_scratch);
-                if (count == 0) {
-                    // quick opt-out prevents us from mixing silent data
+                var count: usize = undefined;
+
+                const end_of_stream = end_of_stream: while (sample_offset < left_buffer.len) {
+                    const increment = std.math.min(left_buffer.len - sample_offset, left_scratch_buffer.len);
+
+                    const left_scratch = left_scratch_buffer[0..increment];
+                    const right_scratch = right_scratch_buffer[0..increment];
+
+                    count = stream.source.fetch(stream.offset, left_scratch, right_scratch);
+                    if (count == 0) {
+                        break :end_of_stream true;
+                    }
+
+                    for (left_scratch[0..count]) |sample, i| {
+                        left_buffer[sample_offset + i] += sample * volume.left;
+                    }
+                    for (right_scratch[0..count]) |sample, i| {
+                        right_buffer[sample_offset + i] += sample * volume.right;
+                    }
+
+                    sample_offset += count;
+                    stream.offset += count;
+
+                    if (count < increment)
+                        break :end_of_stream true;
+                } else false;
+
+                if (end_of_stream) {
+                    if (count == 0) {
+                        if (repeated) {
+                            std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
+                            _ = mixer.streams.swapRemove(stream_index);
+                            continue :next_stream;
+                        }
+                        repeated = true;
+                    }
+                    if (stream.repetition) |*rep| {
+                        if (rep.* > 1) {
+                            std.debug.print("continue loop with {d} repetitions\n", .{rep.*});
+                            // restart playing loop
+                            rep.* -= 1;
+                            stream.offset = 0;
+                            continue :stream_repeater;
+                        }
+                    } else {
+                        std.debug.print("continue loop with infinite repetitions\n", .{});
+                        stream.offset = 0;
+                        continue :stream_repeater;
+                    }
                     std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
                     _ = mixer.streams.swapRemove(stream_index);
                     continue :next_stream;
-                }
-
-                for (left_scratch[0..count]) |sample, i| {
-                    left_buffer[sample_offset + i] += sample * volume.left;
-                }
-                for (right_scratch[0..count]) |sample, i| {
-                    right_buffer[sample_offset + i] += sample * volume.right;
-                }
-
-                if (count < left_scratch.len) {
-                    std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
-                    _ = mixer.streams.swapRemove(stream_index);
+                } else {
+                    // we still had samples left
+                    stream_index += 1;
                     continue :next_stream;
                 }
 
-                stream.offset += count;
+                unreachable;
             }
-
-            // we still had samples left
-            stream_index += 1;
         }
         mixer.time += left_buffer.len;
     }
