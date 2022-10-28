@@ -12,7 +12,7 @@ const std = @import("std");
 
 // Configuration:
 pub const sample_frequency = 44_100;
-pub const panSample: PanLaws.Pan = PanLaws.constantPower;
+pub const panSample = pan_laws.constantPower;
 pub const Sample = f32;
 
 // Implemenation:
@@ -168,7 +168,7 @@ pub const Mixer = struct {
     }
 };
 
-pub const PanLaws = struct {
+pub const pan_laws = struct {
     //! For more information, see
     //! http://www.cs.cmu.edu/~music/icm-online/readings/panlaws/
 
@@ -176,6 +176,7 @@ pub const PanLaws = struct {
     /// `pan` is between -1 and 1
     pub const Pan = fn (LR_Sample, pan: f32) LR_Sample;
 
+    /// trivial implementation, not good audio qualities.
     pub fn linear(sample: LR_Sample, pan: f32) LR_Sample {
         return LR_Sample{
             .left = sample.left * (0.5 - 0.5 * pan),
@@ -183,6 +184,7 @@ pub const PanLaws = struct {
         };
     }
 
+    /// Use when speakers are not parallel
     pub fn constantPower(sample: LR_Sample, pan: f32) LR_Sample {
         const theta = (std.math.pi / 2.0) * (0.5 + 0.5 * pan);
         return LR_Sample{
@@ -190,6 +192,8 @@ pub const PanLaws = struct {
             .right = sample.right * @sin(theta),
         };
     }
+
+    /// Use when speakers are parallel aligned
     pub fn @"-4.5dB"(sample: LR_Sample, pan: f32) LR_Sample {
         const l = 0.5 + 0.5 * pan;
         const theta = l * std.math.pi / 2.0;
