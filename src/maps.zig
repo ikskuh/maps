@@ -10,9 +10,12 @@
 
 const std = @import("std");
 
+// Configuration:
 pub const sample_frequency = 44_100;
-
+pub const panSample: PanLaws.Pan = PanLaws.constantPower;
 pub const Sample = f32;
+
+// Implemenation:
 
 pub const Channel = enum {
     left,
@@ -26,12 +29,21 @@ pub const Mixer = struct {
     next_handle: u32 = 0,
     lock: std.Thread.Mutex = .{},
 
-    pub fn play(mixer: *Mixer, source: AudioSource) error{NoStreamLeft}!StreamHandle {
+    time: u64 = 0,
+
+    pub const RepeatCount = union(enum) { once, repeat: u32, forever };
+    pub fn play(mixer: *Mixer, source: AudioSource, start_offset: ?u64, count: RepeatCount) error{NoStreamLeft}!StreamHandle {
+        std.debug.assert(start_offset == null); // TODO: not implemented yet!
         const stream = mixer.streams.addOne() catch return error.NoStreamLeft;
         stream.* = Stream{
             .handle = @intToEnum(StreamHandle, mixer.next_handle),
             .source = source,
             .offset = 0,
+            .repetition = switch (count) {
+                .once => 1,
+                .repeat => |t| t,
+                .forever => null,
+            },
         };
         mixer.next_handle += 1; // assume we'll never have an overflow here
         return stream.handle;
@@ -81,6 +93,16 @@ pub const Mixer = struct {
         } else error.NotFound;
     }
 
+    /// Converts a time stamp (in seconds) to an offset in samples.
+    pub fn timeToOffset(mixer: Mixer, time_in_s: f64) u64 {
+        _ = mixer;
+        const samples = sample_frequency * time_in_s;
+        return @floatToInt(u64, samples);
+    }
+
+    /// Plays back the currently active streams and renders the output into `left_buffer` and `right_buffer`.
+    /// Also advances time by the number of samples in the buffers.
+    /// Both buffers must have the same number of samples in them.
     pub fn mix(mixer: *Mixer, left_buffer: []Sample, right_buffer: []Sample) void {
         std.debug.assert(left_buffer.len == right_buffer.len);
 
@@ -96,17 +118,16 @@ pub const Mixer = struct {
         next_stream: while (stream_index < mixer.streams.len) {
             const stream = &mixer.streams.buffer[stream_index];
             if (stream.paused) {
-                std.debug.print("render stream {} ({})\n", .{ stream_index, stream.handle });
                 stream_index += 1;
                 continue;
             }
-            std.debug.print("render stream {} ({})\n", .{ stream_index, stream.handle });
 
             // TODO: Implement stream.pitch handling
 
-            // basic linear panning
-            const left_vol = stream.volume * (0.5 - 0.5 * stream.pan);
-            const right_vol = stream.volume * (0.5 + 0.5 * stream.pan);
+            const volume = panSample(.{
+                .left = stream.volume,
+                .right = stream.volume,
+            }, stream.pan);
 
             var sample_offset: usize = 0;
             while (sample_offset < left_buffer.len) {
@@ -125,10 +146,10 @@ pub const Mixer = struct {
                 }
 
                 for (left_scratch[0..count]) |sample, i| {
-                    left_buffer[sample_offset + i] += sample * left_vol;
+                    left_buffer[sample_offset + i] += sample * volume.left;
                 }
                 for (right_scratch[0..count]) |sample, i| {
-                    right_buffer[sample_offset + i] += sample * right_vol;
+                    right_buffer[sample_offset + i] += sample * volume.right;
                 }
 
                 if (count < left_scratch.len) {
@@ -143,8 +164,46 @@ pub const Mixer = struct {
             // we still had samples left
             stream_index += 1;
         }
-        std.debug.print("done mixing {} streams\n", .{stream_index});
+        mixer.time += left_buffer.len;
     }
+};
+
+pub const PanLaws = struct {
+    //! For more information, see
+    //! http://www.cs.cmu.edu/~music/icm-online/readings/panlaws/
+
+    /// Pans a audio sample between left and right, returns the panned sample
+    /// `pan` is between -1 and 1
+    pub const Pan = fn (LR_Sample, pan: f32) LR_Sample;
+
+    pub fn linear(sample: LR_Sample, pan: f32) LR_Sample {
+        return LR_Sample{
+            .left = sample.left * (0.5 - 0.5 * pan),
+            .right = sample.right * (0.5 + 0.5 * pan),
+        };
+    }
+
+    pub fn constantPower(sample: LR_Sample, pan: f32) LR_Sample {
+        const theta = (std.math.pi / 2.0) * (0.5 + 0.5 * pan);
+        return LR_Sample{
+            .left = sample.left * @cos(theta),
+            .right = sample.right * @sin(theta),
+        };
+    }
+    pub fn @"-4.5dB"(sample: LR_Sample, pan: f32) LR_Sample {
+        const l = 0.5 + 0.5 * pan;
+        const theta = l * std.math.pi / 2.0;
+
+        return LR_Sample{
+            .left = sample.left * @sqrt((1.0 - l) * @cos(theta)),
+            .right = sample.right * @sqrt(l * @sin(theta)),
+        };
+    }
+};
+
+pub const LR_Sample = struct {
+    left: Sample,
+    right: Sample,
 };
 
 pub const StreamHandle = enum(u32) {
@@ -158,6 +217,7 @@ pub const Stream = struct {
     offset: usize = 0,
 
     paused: bool = false,
+    repetition: ?u32,
 
     volume: f32 = 1.0, // [0...1]
     pitch: f32 = 1.0, // [0...*]
@@ -202,7 +262,7 @@ pub const SineSource = struct {
     fn fetchSamples(src: AudioSource, offset_hint: usize, left_samples: []Sample, right_samples: []Sample) usize {
         const sine = src.cast(SineSource);
 
-        const waves_per_sample = 2.0 * std.math.tau * sine.frequency / sample_frequency;
+        const waves_per_sample = std.math.tau * sine.frequency / sample_frequency;
 
         var time = waves_per_sample * @intToFloat(f32, offset_hint);
 
@@ -335,7 +395,7 @@ test "mixer basic stream setup" {
 
     var mixer = Mixer{};
 
-    const handle = try mixer.play(file.source());
+    const handle = try mixer.play(file.source(), null, .once);
 
     try std.testing.expectEqual(false, try mixer.isPaused(handle));
     try mixer.pause(handle);
@@ -350,14 +410,18 @@ test "mixer basic stream setup" {
     try std.testing.expectError(error.NotFound, mixer.isPaused(handle));
 }
 
-test "mixer basic mix" {
+test "Mixer.mix" {
     var sine_440 = SineSource{ .frequency = 440 };
     var sine_1000 = SineSource{ .frequency = 1000 };
 
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 0, 0, 0, 1, 0, 0, 0, -1 });
+    defer sound_file.deinit();
+
     var mixer = Mixer{};
 
-    _ = try mixer.play(sine_440.source());
-    _ = try mixer.play(sine_1000.source());
+    _ = try mixer.play(sine_440.source(), null, .once);
+    _ = try mixer.play(sine_1000.source(), null, .once);
+    _ = try mixer.play(sound_file.source(), null, .once);
 
     var left: [4096]f32 = undefined;
     var right: [4096]f32 = undefined;
@@ -367,48 +431,191 @@ test "mixer basic mix" {
     defer file.close();
 
     const num_chunks: usize = 32;
-    try WaveFileWriter.writeHeaders(file.writer(), num_chunks * left.len);
+
+    var file_source = std.io.StreamSource{ .file = file };
+
+    var wave = try WaveFileWriter.begin(&file_source);
 
     var i: usize = 0;
     while (i < num_chunks) : (i += 1) {
         mixer.mix(&left, &right);
 
-        try WaveFileWriter.writeAudio(file.writer(), &left, &right);
+        try wave.write(&left, &right);
     }
+
+    try wave.end();
+}
+
+test "Mixer.play, .once" {
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    defer sound_file.deinit();
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sound_file.source(), null, .once);
+
+    var left: [64]f32 = undefined;
+    var right: [64]f32 = undefined;
+
+    mixer.mix(&left, &right);
+
+    var lc: usize = 0;
+    for (left) |s| {
+        if (s > 0.1) lc += 1;
+    }
+    var rc: usize = 0;
+    for (right) |s| {
+        if (s > 0.1) rc += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lc);
+    try std.testing.expectEqual(@as(usize, 1), rc);
+}
+
+test "Mixer.play, .repeat" {
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    defer sound_file.deinit();
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sound_file.source(), null, .{ .repeat = 3 });
+
+    var left: [64]f32 = undefined;
+    var right: [64]f32 = undefined;
+
+    mixer.mix(&left, &right);
+
+    var lc: usize = 0;
+    for (left) |s| {
+        if (s > 0.1) lc += 1;
+    }
+    var rc: usize = 0;
+    for (right) |s| {
+        if (s > 0.1) rc += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), lc);
+    try std.testing.expectEqual(@as(usize, 3), rc);
+}
+
+test "Mixer.play, .forever" {
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    defer sound_file.deinit();
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sound_file.source(), null, .forever);
+
+    var left: [64]f32 = undefined;
+    var right: [64]f32 = undefined;
+
+    mixer.mix(&left, &right);
+
+    var lc: usize = 0;
+    for (left) |s| {
+        if (s > 0.1) lc += 1;
+    }
+    var rc: usize = 0;
+    for (right) |s| {
+        if (s > 0.1) rc += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, left.len / 4), lc);
+    try std.testing.expectEqual(@as(usize, right.len / 4), rc);
 }
 
 const WaveFileWriter = struct {
-    const File = std.fs.File;
+    pub const Format = enum(u16) {
+        pcm = 0x0001, // 	PCM
+        ieee_float = 0x0003, // 	IEEE float
+        alaw = 0x0006, // 	8-bit ITU-T G.711 A-law
+        mulaw = 0x0007, // 	8-bit ITU-T G.711 µ-law
+        extensible = 0xFFFE, //
+    };
 
-    const channels = 1;
-    const HEADER_SIZE = 36;
-    const SUBCHUNK1_SIZE = 16;
-    const AUDIO_FORMAT = 3; // f32
-    const BIT_DEPTH = 32; // bit
-    const BYTE_SIZE = 8;
-    const PI = 3.14159265358979323846264338327950288;
+    const PCM_Sample = i16;
 
-    fn writeHeaders(file: File.Writer, num_samples: u32) !void {
-        try file.writeAll("RIFF");
-        try file.writeIntLittle(u32, HEADER_SIZE + num_samples);
-        try file.writeAll("WAVEfmt ");
-        try file.writeIntLittle(u32, SUBCHUNK1_SIZE);
-        try file.writeIntLittle(u16, AUDIO_FORMAT);
-        try file.writeIntLittle(u16, channels);
-        try file.writeIntLittle(u32, sample_frequency);
-        try file.writeIntLittle(u32, sample_frequency * channels * (BIT_DEPTH / BYTE_SIZE));
-        try file.writeIntLittle(u16, (channels * (BIT_DEPTH / BYTE_SIZE)));
-        try file.writeIntLittle(u16, BIT_DEPTH);
-        try file.writeAll("data");
-        try file.writeIntLittle(u32, num_samples * channels * (BIT_DEPTH / BYTE_SIZE));
+    stream: *std.io.StreamSource,
+
+    riff_chunk: Chunk,
+    data_chunk: Chunk,
+
+    pub fn begin(stream: *std.io.StreamSource) !WaveFileWriter {
+        const channels = 2;
+
+        try stream.seekTo(0); // make sure we're at the front
+
+        var writer = stream.writer();
+
+        // Start chunk:
+        const riff_chunk = try beginChunk(stream, "RIFF");
+
+        try writer.writeAll("WAVE");
+
+        const fmt_chunk = try beginChunk(stream, "fmt ");
+
+        try writer.writeIntLittle(u16, @enumToInt(Format.pcm)); // wFormatTag
+        try writer.writeIntLittle(u16, channels); // nChannels
+        try writer.writeIntLittle(u32, sample_frequency); // nSamplesPerSec
+
+        try writer.writeIntLittle(u32, channels * sample_frequency * @sizeOf(PCM_Sample)); // nAvgBytesPerSec	Data rate
+        try writer.writeIntLittle(u16, channels * @sizeOf(PCM_Sample)); // nBlockAlign, //  Data block size (bytes)
+        try writer.writeIntLittle(u16, @bitSizeOf(PCM_Sample)); // wBitsPerSample, //  Bits per sample
+
+        try endChunk(stream, fmt_chunk);
+
+        const data_chunk = try beginChunk(stream, "data");
+
+        return WaveFileWriter{
+            .stream = stream,
+            .riff_chunk = riff_chunk,
+            .data_chunk = data_chunk,
+        };
     }
 
-    fn writeAudio(file: File.Writer, left: []const Sample, right: []const Sample) !void {
+    fn mapToSample(in: f32) PCM_Sample {
+        const lo = std.math.minInt(PCM_Sample);
+        const hi = std.math.maxInt(PCM_Sample);
+
+        return @floatToInt(PCM_Sample, std.math.clamp(
+            (hi - lo) * (0.5 + 0.5 * in) + lo,
+            lo,
+            hi,
+        ));
+    }
+
+    pub fn write(wave: *WaveFileWriter, left: []const Sample, right: []const Sample) !void {
+        var buffered_writer = std.io.bufferedWriter(wave.stream.writer());
+
         std.debug.assert(left.len == right.len);
         for (left) |l, i| {
             const r = right[i];
-            try file.writeIntLittle(u32, @bitCast(u32, l));
-            try file.writeIntLittle(u32, @bitCast(u32, r));
+            try buffered_writer.writer().writeIntLittle(PCM_Sample, mapToSample(l));
+            try buffered_writer.writer().writeIntLittle(PCM_Sample, mapToSample(r));
         }
+
+        try buffered_writer.flush();
+    }
+
+    pub fn end(self: *WaveFileWriter) !void {
+        try endChunk(self.stream, self.data_chunk);
+        try endChunk(self.stream, self.riff_chunk);
+    }
+
+    const Chunk = enum(u64) { _ };
+
+    fn beginChunk(out: *std.io.StreamSource, id: *const [4]u8) !Chunk {
+        try out.writer().writeAll(id);
+        const pos = @intToEnum(Chunk, try out.getPos());
+        try out.writer().writeIntLittle(u32, 0xAAAAAAAA); // write bogus data
+        return pos;
+    }
+
+    fn endChunk(out: *std.io.StreamSource, chunk: Chunk) !void {
+        const chunk_start = @enumToInt(chunk);
+        const chunk_end = try out.getPos();
+        try out.seekTo(chunk_start);
+        try out.writer().writeIntLittle(u32, std.math.cast(u32, chunk_end - chunk_start - 4) orelse return error.Overflow);
+        try out.seekTo(chunk_end);
     }
 };
