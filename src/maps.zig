@@ -110,6 +110,10 @@ pub const Mixer = struct {
         std.mem.set(Sample, left_buffer, 0.0);
         std.mem.set(Sample, right_buffer, 0.0);
 
+        // interlocked access to the stream array
+        mixer.lock.lock();
+        defer mixer.lock.unlock();
+
         // std.debug.print("mix {} samples, {} streams\n", .{ left_buffer.len, mixer.streams.len });
 
         var left_scratch_buffer: [256]Sample = undefined;
@@ -392,26 +396,6 @@ pub const SoundFile = struct {
         }
     }
 };
-
-// snd_create(STRING* filename): SOUND*
-// snd_createoal(STRING* filename): SOUND*
-// snd_createstream(STRING* filename): SOUND*
-
-// ent_playsound ( ENTITY*, SOUND*, var volume): handle
-// ent_playsound2 ( ENTITY*, SOUND*, var volume, var range): handle
-// ent_playloop ( ENTITY*, SOUND*, var volume): handle
-// ent_playloop2 ( ENTITY*, SOUND*, var volume, var range): handle
-
-// snd_play ( SOUND*, var Volume, var Balance): handle
-// snd_loop ( SOUND*, var Volume, var Balance): handle
-
-// snd_stopall(mode);
-
-// snd_tune ( var Handle, var Volume, var Freqency, var Balance);
-// snd_cone (var handle, ANGLE* angle, var* cone)
-
-// snd_add(var handle, var offset, void* Sample, var length)
-// snd_buffer(SOUND* snd, void** pDesc, void*** ppSample)
 
 test "mixer instantiation" {
     var mixer = Mixer{};
@@ -711,3 +695,21 @@ const WaveFileWriter = struct {
         try out.seekTo(chunk_end);
     }
 };
+
+// inspiration:
+// snd_create(STRING* filename): SOUND*
+// snd_createoal(STRING* filename): SOUND*
+// snd_createstream(STRING* filename): SOUND*
+
+// ent_playsound ( ENTITY*, SOUND*, var volume): handle
+// ent_playsound2 ( ENTITY*, SOUND*, var volume, var range): handle
+// ent_playloop ( ENTITY*, SOUND*, var volume): handle
+// ent_playloop2 ( ENTITY*, SOUND*, var volume, var range): handle
+
+// snd_stopall(mode);
+
+// snd_tune ( var Handle, var Volume, var Freqency, var Balance);
+// snd_cone (var handle, ANGLE* angle, var* cone)
+
+// snd_add(var handle, var offset, void* Sample, var length)
+// snd_buffer(SOUND* snd, void** pDesc, void*** ppSample)
