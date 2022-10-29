@@ -33,7 +33,6 @@ pub const Mixer = struct {
 
     pub const RepeatCount = union(enum) { once, repeat: u32, forever };
     pub fn play(mixer: *Mixer, source: AudioSource, start_offset: ?u64, count: RepeatCount) error{NoStreamLeft}!StreamHandle {
-        std.debug.assert(start_offset == null); // TODO: not implemented yet!
         const stream = mixer.streams.addOne() catch return error.NoStreamLeft;
         stream.* = Stream{
             .handle = @intToEnum(StreamHandle, mixer.next_handle),
@@ -44,7 +43,9 @@ pub const Mixer = struct {
                 .repeat => |t| t,
                 .forever => null,
             },
+            .start_at = start_offset orelse mixer.time, // start at specified time or *now*
         };
+        std.debug.assert(stream.start_at >= mixer.time);
         mixer.next_handle += 1; // assume we'll never have an overflow here
         return stream.handle;
     }
@@ -109,7 +110,7 @@ pub const Mixer = struct {
         std.mem.set(Sample, left_buffer, 0.0);
         std.mem.set(Sample, right_buffer, 0.0);
 
-        std.debug.print("mix {} samples, {} streams\n", .{ left_buffer.len, mixer.streams.len });
+        // std.debug.print("mix {} samples, {} streams\n", .{ left_buffer.len, mixer.streams.len });
 
         var left_scratch_buffer: [256]Sample = undefined;
         var right_scratch_buffer: [256]Sample = undefined;
@@ -122,6 +123,12 @@ pub const Mixer = struct {
                 continue;
             }
 
+            if (stream.start_at >= mixer.time + left_buffer.len) {
+                // stream is not playing yet, and will not start playing in this mixing process
+                stream_index += 1;
+                continue;
+            }
+
             // TODO: Implement stream.pitch handling
 
             const volume = panSample(.{
@@ -129,11 +136,11 @@ pub const Mixer = struct {
                 .right = stream.volume,
             }, stream.pan);
 
-            var sample_offset: usize = 0;
+            var sample_offset: usize = stream.start_at -| mixer.time;
 
             var repeated = false;
             stream_repeater: while (true) {
-                std.debug.print("begin mix {} @ {}\n", .{ stream_index, sample_offset });
+                // std.debug.print("begin mix {} @ {} ({})\n", .{ stream_index, sample_offset, mixer.time + sample_offset });
 
                 var count: usize = undefined;
 
@@ -165,7 +172,7 @@ pub const Mixer = struct {
                 if (end_of_stream) {
                     if (count == 0) {
                         if (repeated) {
-                            std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
+                            // std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
                             _ = mixer.streams.swapRemove(stream_index);
                             continue :next_stream;
                         }
@@ -173,18 +180,18 @@ pub const Mixer = struct {
                     }
                     if (stream.repetition) |*rep| {
                         if (rep.* > 1) {
-                            std.debug.print("continue loop with {d} repetitions\n", .{rep.*});
+                            // std.debug.print("continue loop with {d} repetitions\n", .{rep.*});
                             // restart playing loop
                             rep.* -= 1;
                             stream.offset = 0;
                             continue :stream_repeater;
                         }
                     } else {
-                        std.debug.print("continue loop with infinite repetitions\n", .{});
+                        // std.debug.print("continue loop with infinite repetitions\n", .{});
                         stream.offset = 0;
                         continue :stream_repeater;
                     }
-                    std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
+                    // std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
                     _ = mixer.streams.swapRemove(stream_index);
                     continue :next_stream;
                 } else {
@@ -251,6 +258,7 @@ pub const Stream = struct {
 
     source: AudioSource,
     offset: usize = 0,
+    start_at: u64,
 
     paused: bool = false,
     repetition: ?u32,
@@ -558,6 +566,54 @@ test "Mixer.play, .forever" {
 
     try std.testing.expectEqual(@as(usize, left.len / 4), lc);
     try std.testing.expectEqual(@as(usize, right.len / 4), rc);
+}
+
+test "Mixer.play, delayed start (inside buffer)" {
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    defer sound_file.deinit();
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sound_file.source(), 32, .once);
+
+    var left: [64]f32 = undefined;
+    var right: [64]f32 = undefined;
+
+    mixer.mix(&left, &right);
+
+    for (left) |s, i| {
+        try std.testing.expect(s == 0 or i == 32);
+    }
+    for (right) |s, i| {
+        try std.testing.expect(s == 0 or i == 32);
+    }
+}
+
+test "Mixer.play, delayed start (skipping buffers, perfect start)" {
+    var sound_file = try SoundFile.initRawMono(std.testing.allocator, &.{ 1, 0, 0, 0 });
+    defer sound_file.deinit();
+
+    var mixer = Mixer{};
+
+    _ = try mixer.play(sound_file.source(), 32, .once);
+
+    var left: [16]f32 = undefined;
+    var right: [16]f32 = undefined;
+
+    mixer.mix(&left, &right);
+    try std.testing.expect(std.mem.allEqual(f32, left[0..], 0.0));
+    try std.testing.expect(std.mem.allEqual(f32, right[0..], 0.0));
+    mixer.mix(&left, &right);
+    try std.testing.expect(std.mem.allEqual(f32, left[0..], 0.0));
+    try std.testing.expect(std.mem.allEqual(f32, right[0..], 0.0));
+    mixer.mix(&left, &right);
+    try std.testing.expect(left[0] != 0.0);
+    try std.testing.expect(right[0] != 0.0);
+    try std.testing.expect(std.mem.allEqual(f32, left[1..], 0.0));
+    try std.testing.expect(std.mem.allEqual(f32, right[1..], 0.0));
+    mixer.mix(&left, &right);
+    try std.testing.expect(std.mem.allEqual(f32, left[0..], 0.0));
+    try std.testing.expect(std.mem.allEqual(f32, right[0..], 0.0));
 }
 
 const WaveFileWriter = struct {
