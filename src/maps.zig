@@ -75,7 +75,8 @@ pub const Mixer = struct {
 
         const stream = try mixer.resolve(handle);
         const index = (@ptrToInt(stream) - @ptrToInt(&mixer.streams.buffer)) / @sizeOf(Stream);
-        _ = mixer.streams.swapRemove(index);
+
+        mixer.removeStream(index);
     }
 
     pub fn isPaused(mixer: *Mixer, handle: StreamHandle) error{NotFound}!bool {
@@ -177,7 +178,7 @@ pub const Mixer = struct {
                     if (count == 0) {
                         if (repeated) {
                             // std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
-                            _ = mixer.streams.swapRemove(stream_index);
+                            mixer.removeStream(stream_index);
                             continue :next_stream;
                         }
                         repeated = true;
@@ -196,7 +197,7 @@ pub const Mixer = struct {
                         continue :stream_repeater;
                     }
                     // std.debug.print("kill stream {} ({})\n", .{ stream_index, stream.handle });
-                    _ = mixer.streams.swapRemove(stream_index);
+                    mixer.removeStream(stream_index);
                     continue :next_stream;
                 } else {
                     // we still had samples left
@@ -208,6 +209,13 @@ pub const Mixer = struct {
             }
         }
         mixer.time += left_buffer.len;
+    }
+
+    // DO NOT CALL IN UNPROTECTED CONTEXT. MUTEX MUST BE LOCKED!
+    fn removeStream(mixer: *Mixer, stream_index: usize) void {
+        std.debug.assert(mixer.lock.tryLock() == false);
+        var stream = mixer.streams.swapRemove(stream_index);
+        stream.source.destroy();
     }
 };
 
@@ -275,16 +283,23 @@ pub const Stream = struct {
 pub const AudioSource = struct {
     pub const VTable = struct {
         fetchPtr: *const fn (AudioSource, usize, []Sample, []Sample) usize,
+        deletePtr: ?*const fn (AudioSource) void,
     };
 
     erased: *anyopaque,
     vtable: *const VTable,
 
-    pub fn init(any: anytype, vtable: *const VTable) AudioSource {
+    pub fn create(any: anytype, vtable: *const VTable) AudioSource {
         return AudioSource{
             .erased = @ptrCast(*anyopaque, any),
             .vtable = vtable,
         };
+    }
+
+    pub fn destroy(source: AudioSource) void {
+        if (source.vtable.deletePtr) |delete| {
+            delete(source);
+        }
     }
 
     pub fn cast(source: AudioSource, comptime T: type) *T {
@@ -300,6 +315,7 @@ pub const AudioSource = struct {
 pub const SineSource = struct {
     const vtable = AudioSource.VTable{
         .fetchPtr = fetchSamples,
+        .deletePtr = null,
     };
 
     frequency: f32 = 440,
@@ -331,6 +347,7 @@ pub const SineSource = struct {
 pub const SoundFile = struct {
     const vtable = AudioSource.VTable{
         .fetchPtr = fetchSamples,
+        .deletePtr = null,
     };
 
     allocator: std.mem.Allocator,
